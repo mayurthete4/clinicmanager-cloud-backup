@@ -1,0 +1,7 @@
+Flask==3.0.3
+gunicorn==22.0.0
+psycopg2-binary==2.9.9
+# Signs entitlement payloads so a client can tell a real answer from a spoofed one.
+cryptography==43.0.3
+# Server-to-server verification of Play subscriptions (RTDN handling).
+google-auth==2.35.0
