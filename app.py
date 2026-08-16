@@ -96,6 +96,28 @@ def get_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS ix_change_log_account_seq ON change_log (account_id, seq)"
             )
+            # Per-member key envelopes: the clinic's cloud credentials,
+            # encrypted client-side with a key derived from that one staff
+            # member's own login password. It is what lets someone sign in on
+            # a brand-new device with just their email and password and have
+            # the clinic's data appear - no cloud password to hand around, no
+            # per-device setup.
+            #
+            # The server stores ciphertext and a salt, exactly as it does for
+            # backups: it cannot open an envelope, because it never sees the
+            # member's password. Losing this table costs convenience (devices
+            # must pair with a code again), not data.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS key_envelopes (
+                    member_email TEXT PRIMARY KEY,
+                    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    blob BYTEA NOT NULL,
+                    salt TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
         g.db.commit()
     return g.db
 
@@ -150,6 +172,30 @@ def require_account_auth(view):
 
     wrapped.__name__ = view.__name__
     return wrapped
+
+
+# In-process rate limit for the one unauthenticated endpoint that returns
+# anything derived from an account. Per email and per IP: a single server
+# process backs this deployment, so a dict is enough and a Redis dependency
+# would be ceremony. Worst case on a restart is a counter reset, not a bypass
+# of the encryption itself.
+_ENVELOPE_FETCH_ATTEMPTS: dict[str, list[float]] = {}
+_ENVELOPE_FETCH_WINDOW_SECONDS = 300
+_ENVELOPE_FETCH_MAX = 10
+
+
+def _allow_envelope_fetch(member_email: str, remote_addr: str) -> bool:
+    import time
+
+    now = time.time()
+    for key in (f"email:{member_email}", f"ip:{remote_addr}"):
+        hits = [t for t in _ENVELOPE_FETCH_ATTEMPTS.get(key, []) if now - t < _ENVELOPE_FETCH_WINDOW_SECONDS]
+        if len(hits) >= _ENVELOPE_FETCH_MAX:
+            _ENVELOPE_FETCH_ATTEMPTS[key] = hits
+            return False
+        hits.append(now)
+        _ENVELOPE_FETCH_ATTEMPTS[key] = hits
+    return True
 
 
 @app.route("/signup", methods=["POST"])
@@ -334,6 +380,93 @@ def pair_claim():
 # Max change entries accepted in one /sync/push call - keeps one runaway
 # client batch (e.g. a bulk import) from blocking on one giant transaction.
 MAX_SYNC_PUSH_BATCH = 500
+
+
+@app.route("/keys/envelope", methods=["POST"])
+@require_account_auth
+def keys_envelope_put():
+    """Store (or replace) one staff member's envelope.
+
+    Called by an already-connected device that has both the clinic's cloud
+    credentials and, for a moment, that member's own password - when an admin
+    creates their login, when they change their password, or when they sign in.
+    The blob arrives already encrypted; this endpoint is storage, not crypto.
+    """
+    import base64
+
+    data = request.get_json(silent=True) or {}
+    member_email = (data.get("member_email") or "").strip().lower()[:255]
+    blob_b64 = data.get("blob") or ""
+    salt = (data.get("salt") or "").strip()
+    if "@" not in member_email or not blob_b64 or not salt:
+        return jsonify({"error": "member_email, blob, and salt are required"}), 400
+    try:
+        blob = base64.b64decode(blob_b64)
+    except Exception:
+        return jsonify({"error": "invalid blob"}), 400
+    if len(blob) > 8192:
+        return jsonify({"error": "blob too large"}), 400
+
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO key_envelopes (member_email, account_id, blob, salt, updated_at)
+            VALUES (%s, %s, %s, %s, now())
+            ON CONFLICT (member_email) DO UPDATE
+            SET account_id = EXCLUDED.account_id,
+                blob = EXCLUDED.blob,
+                salt = EXCLUDED.salt,
+                updated_at = now()
+            """,
+            (member_email, g.account["id"], psycopg2.Binary(blob), salt),
+        )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/keys/envelope/fetch", methods=["POST"])
+def keys_envelope_fetch():
+    """Hand back one member's envelope, by email.
+
+    Deliberately unauthenticated: the caller is a device that has nothing yet -
+    that is the whole point. What it gets is ciphertext plus a salt, useless
+    without the member's own password, which the server has never seen. The
+    risk this carries is an offline guessing attack on a weak password by
+    someone who knows a staff email, which is why the KDF is deliberately slow
+    (see _derive_backup_key on the client) and why this is rate limited.
+    """
+    data = request.get_json(silent=True) or {}
+    member_email = (data.get("member_email") or "").strip().lower()[:255]
+    if "@" not in member_email:
+        return jsonify({"error": "member_email is required"}), 400
+
+    if not _allow_envelope_fetch(member_email, request.remote_addr or ""):
+        return jsonify({"error": "too many attempts, try again shortly"}), 429
+
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT e.blob, e.salt, a.username
+            FROM key_envelopes e
+            JOIN accounts a ON a.id = e.account_id
+            WHERE e.member_email = %s
+            """,
+            (member_email,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return jsonify({"error": "not found"}), 404
+
+    import base64
+
+    blob, salt, account_username = row
+    return jsonify({
+        "blob": base64.b64encode(bytes(blob)).decode("ascii"),
+        "salt": salt,
+        "account_username": account_username,
+    })
 
 
 @app.route("/sync/push", methods=["POST"])
