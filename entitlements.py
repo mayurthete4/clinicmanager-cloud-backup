@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import psycopg2
@@ -127,6 +128,17 @@ def init_entitlement_tables(db) -> None:
             )
             """
         )
+        # Which product the customer bought - "clinic", "pharmacy", or both -
+        # kept separate from tier because they answer different questions. A
+        # pharmacy on Basic and a hospital on Platinum are both ordinary, and
+        # folding the two together would need a new tier per product.
+        #
+        # Empty means "not stated", which is what every existing grant reads as,
+        # and leaves the install to fall back on its licence key or its own
+        # seeded answer rather than being silently stripped of half the app.
+        cur.execute(
+            "ALTER TABLE entitlement_grants ADD COLUMN IF NOT EXISTS modules TEXT NOT NULL DEFAULT ''"
+        )
         # Play purchase tokens are the join between an RTDN (which knows the
         # token, not the install) and an install (which knows the token because
         # its own client sent it up after purchase).
@@ -207,12 +219,36 @@ def _account_key(email: str) -> str:
     return _ACCOUNT_KEY_PREFIX + email.strip().lower()
 
 
+VALID_MODULES = ("clinic", "pharmacy")
+
+_MODULE_ALIASES = {
+    "medical": "pharmacy",
+    "shop": "pharmacy",
+    "hospital": "clinic",
+}
+
+
+def _parse_modules(raw) -> list[str]:
+    """Accept a list or a comma string, and keep only real module names."""
+    if isinstance(raw, str):
+        parts = [p for p in re.split(r"[,\s|+]+", raw) if p]
+    else:
+        parts = list(raw or ())
+    out = []
+    for part in parts:
+        name = str(part).strip().lower()
+        name = _MODULE_ALIASES.get(name, name)
+        if name in VALID_MODULES and name not in out:
+            out.append(name)
+    return out
+
+
 def _active_grants(db, identifier: str) -> list[dict]:
     now = datetime.now(timezone.utc)
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT source, tier, expires_at, revoked
+            SELECT source, tier, expires_at, revoked, modules
             FROM entitlement_grants
             WHERE install_id = %s AND revoked = FALSE
             """,
@@ -249,11 +285,18 @@ def resolve_entitlement(
     if "@" in email:
         grants.extend(_active_grants(db, _account_key(email)))
 
+    # Modules are collected across every active grant rather than taken from
+    # the winning one alone: a support comp that only raises the tier must not
+    # blank the product the customer actually bought.
+    granted_modules: list[str] = []
     for grant in grants:
         tier = grant["tier"]
         if TIER_RANK.get(tier, -1) > TIER_RANK.get(best_tier, -1):
             best_tier = tier
             expires_at = grant["expires_at"]
+        for name in _parse_modules(grant.get("modules")):
+            if name not in granted_modules:
+                granted_modules.append(name)
 
     limits = TIER_LIMITS.get(best_tier, TIER_LIMITS["free"])
     features = TIER_FEATURES.get(best_tier, [])
@@ -266,6 +309,9 @@ def resolve_entitlement(
         "install_id": install_id,
         "tier": wire_tier,
         "cohort": cohort,
+        # Omitted entirely when nothing was granted, so the client cannot tell
+        # "no modules" from "not stated" and wrongly disable everything.
+        **({"modules": sorted(granted_modules)} if granted_modules else {}),
         "features": features,
         "limits": limits,
         "expires_at": expires_at.isoformat() if expires_at else "",
@@ -305,20 +351,22 @@ def upsert_grant(
     expires_at: datetime | None,
     revoked: bool = False,
     note: str = "",
+    modules: str = "",
 ) -> None:
     with db.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO entitlement_grants (install_id, source, tier, expires_at, revoked, note, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, now())
+            INSERT INTO entitlement_grants (install_id, source, tier, expires_at, revoked, note, modules, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (install_id, source) DO UPDATE
             SET tier = EXCLUDED.tier,
                 expires_at = EXCLUDED.expires_at,
                 revoked = EXCLUDED.revoked,
                 note = EXCLUDED.note,
+                modules = EXCLUDED.modules,
                 updated_at = now()
             """,
-            (install_id, source, tier, expires_at, revoked, note),
+            (install_id, source, tier, expires_at, revoked, note, modules),
         )
     db.commit()
 
@@ -462,8 +510,15 @@ def register_entitlement_routes(app, get_db):
             expires_at=expires_at,
             revoked=bool(data.get("revoked")),
             note=str(data.get("note") or "")[:500],
+            modules=",".join(_parse_modules(data.get("modules"))),
         )
-        return jsonify({"ok": True, "granted_to": email or install_id})
+        return jsonify(
+            {
+                "ok": True,
+                "granted_to": email or install_id,
+                "modules": _parse_modules(data.get("modules")),
+            }
+        )
 
     @app.route("/admin/installs", methods=["GET"])
     def admin_list_installs():
@@ -480,7 +535,7 @@ def register_entitlement_routes(app, get_db):
                        (
                        COALESCE(
                            (SELECT json_agg(json_build_object(
-                                'source', g.source, 'tier', g.tier,
+                                'source', g.source, 'tier', g.tier, 'modules', g.modules,
                                 'expires_at', g.expires_at, 'revoked', g.revoked,
                                 'via_account', false
                             ))
@@ -497,7 +552,7 @@ def register_entitlement_routes(app, get_db):
                        -- endpoint exists to prevent.
                        COALESCE(
                            (SELECT json_agg(json_build_object(
-                                'source', g.source, 'tier', g.tier,
+                                'source', g.source, 'tier', g.tier, 'modules', g.modules,
                                 'expires_at', g.expires_at, 'revoked', g.revoked,
                                 'via_account', true
                             ))
@@ -571,6 +626,7 @@ _ADMIN_UI_HTML = """<!doctype html>
   .card { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
   .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.5rem; }
   input, select { padding: 0.35rem 0.5rem; border: 1px solid #999; border-radius: 5px; }
+  .hint { color: #666; font-size: 0.85rem; }
   input[type=text], input[type=password], input[type=number] { min-width: 160px; }
   button { padding: 0.35rem 0.9rem; border-radius: 5px; border: 1px solid #555; background: #f0f0f0; cursor: pointer; }
   button.primary { background: #1a5fb4; color: #fff; border-color: #1a5fb4; }
@@ -619,6 +675,17 @@ _ADMIN_UI_HTML = """<!doctype html>
     <label for="days">Days valid (blank = no expiry)</label>
     <input type="number" id="days" min="1" placeholder="e.g. 365" />
     <label><input type="checkbox" id="revoked" /> Revoke instead</label>
+  </div>
+  <div class="row">
+    <label for="modules">Product</label>
+    <select id="modules">
+      <option value="" selected>not stated (leave as-is)</option>
+      <option value="clinic">clinic / hospital only</option>
+      <option value="pharmacy">medical shop only</option>
+      <option value="clinic,pharmacy">both</option>
+    </select>
+    <span class="hint">"Not stated" leaves the install on its licence key or its own
+      detected setting - pick a product only when you mean to decide it from here.</span>
   </div>
   <div class="row">
     <label for="note">Note</label>
@@ -700,6 +767,7 @@ _ADMIN_UI_HTML = """<!doctype html>
       tier: document.getElementById("tier").value,
       revoked: document.getElementById("revoked").checked,
       note: document.getElementById("note").value.trim(),
+      modules: document.getElementById("modules").value,
     };
     body[byAccount ? "email" : "install_id"] = target;
     var days = document.getElementById("days").value.trim();
@@ -714,7 +782,11 @@ _ADMIN_UI_HTML = """<!doctype html>
       .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
       .then(function (res) {
         if (!res.ok) { setStatus("Failed: " + (res.body.error || "unknown error"), true); return; }
-        setStatus("Applied " + body.tier + (body.revoked ? " (revoked)" : "") + " to " + target + ".");
+        var mods = (res.body.modules || []).join(" + ");
+        setStatus(
+          "Applied " + body.tier + (body.revoked ? " (revoked)" : "") +
+          (mods ? " [" + mods + "]" : "") + " to " + target + "."
+        );
         if (!byAccount) loadInstalls();
       })
       .catch(function (e) { setStatus("Request failed: " + e, true); });
@@ -741,7 +813,8 @@ _ADMIN_UI_HTML = """<!doctype html>
       var cls = "grant-line" + (g.revoked ? " revoked" : "");
       var exp = g.expires_at ? g.expires_at : "no expiry";
       var label = g.via_account ? "account: " : "";
-      return "<div class=\\"" + cls + "\\">" + label + g.source + ": " + g.tier + " (" + exp + ")</div>";
+      var mods = g.modules ? " \u00b7 " + g.modules : "";
+      return "<div class=\\"" + cls + "\\">" + label + g.source + ": " + g.tier + mods + " (" + exp + ")</div>";
     }).join("");
   }
 

@@ -96,6 +96,25 @@ def get_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS ix_change_log_account_seq ON change_log (account_id, seq)"
             )
+            # How far each device has read. Without this the change log can
+            # only grow: there is no way to know whether a row still has a
+            # reader, and deleting one that does loses it for that device
+            # permanently and silently - the worst failure this system has.
+            #
+            # With it, a change can be dropped once every device that is still
+            # turning up has read it, which for a clinic with two devices used
+            # daily is almost immediately.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS device_cursors (
+                    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    device_id TEXT NOT NULL,
+                    last_seq BIGINT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (account_id, device_id)
+                )
+                """
+            )
             # Per-member key envelopes: the clinic's cloud credentials,
             # encrypted client-side with a key derived from that one staff
             # member's own login password. It is what lets someone sign in on
@@ -507,6 +526,7 @@ def sync_push():
             )
             seqs.append(cur.fetchone()[0])
     db.commit()
+    _prune_change_log(db, g.account["id"])
     return jsonify({"ok": True, "seqs": seqs})
 
 
@@ -514,6 +534,70 @@ def sync_push():
 # offline a long time (or a brand-new device bootstrapping since=0) pages
 # through history instead of pulling an unbounded result set in one response.
 MAX_SYNC_PULL_BATCH = 500
+
+
+# A device that has not pulled in this long stops holding the log open. A
+# phone that was lost or replaced would otherwise pin every change ever made,
+# forever, on the strength of a cursor nobody is behind any more.
+DEVICE_CURSOR_ACTIVE_DAYS = int(os.getenv("SYNC_DEVICE_ACTIVE_DAYS", "60") or 60)
+# Even once every device has read a change, it is kept this long. Nothing
+# depends on it, but a log with some history in it is worth a great deal the
+# day something needs explaining, and the cost is small.
+CHANGE_LOG_GRACE_DAYS = int(os.getenv("SYNC_CHANGE_LOG_GRACE_DAYS", "7") or 7)
+
+
+def _prune_change_log(db, account_id: int) -> int:
+    """Drop changes every active device has already read.
+
+    The rule is deliberately conservative, because the failure it risks is the
+    one that cannot be undone: delete a change before its device reads it and
+    that device never learns about it. So a row goes only when it is behind
+    *every* cursor - not the average, not most of them - and only once it is
+    also older than the grace window.
+
+    A device that has not been seen for DEVICE_CURSOR_ACTIVE_DAYS is left out
+    of that minimum. It can then fall off the end of the log, which is exactly
+    why /sync/pull reports where the log begins: that device is told to take
+    the whole database instead of pretending it can catch up."""
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(MIN(last_seq), 0) AS floor_seq, COUNT(*) AS devices
+                FROM device_cursors
+                WHERE account_id = %s
+                  AND updated_at > now() - INTERVAL '%s days'
+                """,
+                (account_id, DEVICE_CURSOR_ACTIVE_DAYS),
+            )
+            row = cur.fetchone()
+            floor_seq, devices = row[0], row[1]
+            # No device has ever reported a position: nothing is provably read,
+            # so nothing may be deleted.
+            if not devices or not floor_seq:
+                return 0
+
+            cur.execute(
+                """
+                DELETE FROM change_log
+                WHERE account_id = %s
+                  AND seq <= %s
+                  AND created_at < now() - INTERVAL '%s days'
+                """,
+                (account_id, floor_seq, CHANGE_LOG_GRACE_DAYS),
+            )
+            removed = cur.rowcount or 0
+        db.commit()
+        return removed
+    except Exception:
+        # Housekeeping must never cost a clinic its push. The log being larger
+        # than it needs to be is a bill; a failed push is lost work.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        app.logger.exception("Pruning the change log failed for account %s", account_id)
+        return 0
 
 
 @app.route("/sync/pull", methods=["GET"])
@@ -528,7 +612,25 @@ def sync_pull():
     except ValueError:
         return jsonify({"error": "since must be an integer"}), 400
 
+    device_id = (request.args.get("device_id") or "").strip()
     db = get_db()
+    if device_id:
+        # Recorded before the read, deliberately: `since` is what this device
+        # has finished applying, so it is safe to mark as read even if the
+        # page it is about to fetch never arrives. Overstating it is the one
+        # thing that could get a change pruned before its reader saw it.
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO device_cursors (account_id, device_id, last_seq, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (account_id, device_id) DO UPDATE
+                SET last_seq = GREATEST(device_cursors.last_seq, EXCLUDED.last_seq),
+                    updated_at = now()
+                """,
+                (g.account["id"], device_id, since),
+            )
+        db.commit()
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
@@ -541,6 +643,29 @@ def sync_pull():
             (g.account["id"], since, MAX_SYNC_PULL_BATCH),
         )
         rows = cur.fetchall()
+
+        # The high-water mark for this account, independent of what was asked
+        # for. A device stores how far it has read; if this database is ever
+        # rebuilt (a restore, a migration, a free instance being reclaimed)
+        # seq restarts at 1 while devices still hold the old, much larger
+        # number. They would then ask for changes after a seq that will not
+        # exist again for months, receive nothing, and sync would be dead
+        # silently and permanently. Telling them where the log actually ends
+        # is what lets them notice.
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(seq), 0) AS max_seq, COALESCE(MIN(seq), 0) AS min_seq
+            FROM change_log WHERE account_id = %s
+            """,
+            (g.account["id"],),
+        )
+        bounds = cur.fetchone()
+        account_max_seq = bounds["max_seq"]
+        # Where the log now begins. A device below this has missed changes
+        # that were pruned before it read them and cannot catch up from the
+        # log at all - it needs the whole database instead, and has to be told
+        # so rather than quietly carrying on a few hundred rows short.
+        account_min_seq = bounds["min_seq"]
 
     changes = [
         {
@@ -555,7 +680,12 @@ def sync_pull():
         for row in rows
     ]
     latest_seq = changes[-1]["seq"] if changes else since
-    return jsonify({"changes": changes, "latest_seq": latest_seq})
+    return jsonify({
+        "changes": changes,
+        "latest_seq": latest_seq,
+        "account_max_seq": account_max_seq,
+        "account_min_seq": account_min_seq,
+    })
 
 
 @app.route("/")
