@@ -30,6 +30,59 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # upload from blowing through Neon's free-tier storage cap on its own.
 MAX_BACKUP_BYTES = int(os.getenv("MAX_BACKUP_BYTES", str(200 * 1024 * 1024)))
 
+# How often one account may replace its whole-database backup.
+#
+# This is the server's own defence against a client that does not know any
+# better. Builds before 1.13.18 upload the entire database, uncompressed, after
+# every two-minute lull - which put 5.83 GB through one workspace's allowance
+# in days and suspended the service, taking every device's sync down with it.
+# 1.13.18 fixed that in the client, but a client that has not been updated
+# cannot be reasoned with, and the account holder is the one who pays.
+#
+# It separates the two cleanly without needing to know anything about the
+# client: a current build snapshots weekly and will never come close to this
+# limit, while an old one is cut from hundreds of uploads a day to four.
+#
+# Only the whole-database snapshot is throttled. Row-level sync - every
+# patient, visit and payment - goes through /sync/push and /sync/pull and is
+# untouched, so an old client still syncs normally. It just stops re-uploading
+# the entire database on top.
+#
+# 0 disables the limit.
+MIN_BACKUP_INTERVAL_SECONDS = int(os.getenv("MIN_BACKUP_INTERVAL_SECONDS", str(6 * 3600)))
+
+# Refuse a client older than this outright. Empty disables it, which is the
+# default, because a build that predates the header sends no version at all and
+# must not be mistaken for a bad one - absence means "cannot tell", never
+# "too old".
+MIN_CLIENT_VERSION = os.getenv("MIN_CLIENT_VERSION", "").strip()
+
+
+def _version_tuple(raw: str):
+    """(1, 13, 20) from "1.13.20", or None if it is not a version at all."""
+    parts = (raw or "").strip().split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def _client_is_too_old() -> bool:
+    """Whether this request came from a build the account holder has shut out.
+
+    A missing header is never "too old": every build before this check existed
+    sends nothing, and treating that as a refusal would lock out exactly the
+    installs that cannot be told apart yet."""
+    if not MIN_CLIENT_VERSION:
+        return False
+    sent = _version_tuple(request.headers.get("X-ClinicManager-Version", ""))
+    minimum = _version_tuple(MIN_CLIENT_VERSION)
+    if sent is None or minimum is None:
+        return False
+    return sent < minimum
+
 
 def get_db():
     if "db" not in g:
@@ -251,6 +304,12 @@ def login():
 @app.route("/backup", methods=["PUT"])
 @require_account_auth
 def upload_backup():
+    if _client_is_too_old():
+        return jsonify({
+            "error": "this version is no longer accepted - please update ClinicManager",
+            "min_version": MIN_CLIENT_VERSION,
+        }), 426
+
     encrypted = request.get_data(cache=False)
     if not encrypted:
         return jsonify({"error": "empty backup body"}), 400
@@ -258,6 +317,34 @@ def upload_backup():
         return jsonify({"error": "backup too large"}), 413
 
     db = get_db()
+
+    # Refused before the blob is written, not after - the point is to not pay
+    # to store it. The body has already crossed the wire either way, but that
+    # is the small half: what actually burned the allowance was this service
+    # writing the blob into Postgres over and over.
+    if MIN_BACKUP_INTERVAL_SECONDS > 0:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT EXTRACT(EPOCH FROM (now() - updated_at))::bigint"
+                " FROM backups WHERE account_id = %s",
+                (g.account["id"],),
+            )
+            row = cur.fetchone()
+        if row is not None and row[0] is not None and row[0] < MIN_BACKUP_INTERVAL_SECONDS:
+            wait = MIN_BACKUP_INTERVAL_SECONDS - int(row[0])
+            app.logger.info(
+                "Throttled whole-database upload for account %s - last one was %ss ago",
+                g.account["id"], int(row[0]),
+            )
+            response = jsonify({
+                "error": "a recent backup already exists for this account",
+                "retry_after_seconds": wait,
+            })
+            # 429 and not an error the client will treat as a broken server:
+            # nothing is wrong, and its row-level sync is still working.
+            response.headers["Retry-After"] = str(wait)
+            return response, 429
+
     with db.cursor() as cur:
         # Returns updated_at so the client can record *this server's* timestamp
         # for the push. Without it the client had to fall back on its own clock,
