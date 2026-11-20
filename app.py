@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 
 import psycopg2
 import psycopg2.extras
@@ -240,6 +241,9 @@ def require_account_auth(view):
             return jsonify({"error": "invalid credentials"}), 401
 
         g.account = account
+        refused = _refuse_if_cloud_lapsed(auth.username)
+        if refused is not None:
+            return refused
         return view(*args, **kwargs)
 
     wrapped.__name__ = view.__name__
@@ -270,6 +274,64 @@ def _allow_envelope_fetch(member_email: str, remote_addr: str) -> bool:
     return True
 
 
+# A new cloud account needs the seller's say-so: cloud backup ticked for that
+# email in /admin/ui. The desktop app checks too, but the app runs on the
+# customer's machine and can be changed; this is the check that holds. Logging
+# in to an account that already exists is not affected. Set to 0 only to go
+# back to open signups.
+CLOUD_SIGNUP_REQUIRES_GRANT = os.getenv("CLOUD_SIGNUP_REQUIRES_GRANT", "1").strip() != "0"
+
+# What an account whose cloud days have run out (or were taken away) may still
+# do: prove who it is, read its status, and download its own last backup. Its
+# data is never held hostage - it just stops being backed up and synced.
+_CLOUD_LAPSED_ALLOWED = {("/login", "POST"), ("/backup", "GET"), ("/status", "GET")}
+
+
+def _refuse_if_cloud_lapsed(username: str):
+    """403 for an account whose cloud access has expired or been removed in
+    /admin/ui. Accounts the card has never touched ("none") are left alone, so
+    every clinic connected before cloud access existed keeps working. Fails
+    open on a lookup error: a database hiccup must not cut a paying clinic off."""
+    if not CLOUD_SIGNUP_REQUIRES_GRANT:
+        return None
+    if (request.path, request.method) in _CLOUD_LAPSED_ALLOWED:
+        return None
+    try:
+        from entitlements import cloud_access_state
+        state = cloud_access_state(get_db(), _signup_email(username))
+    except Exception:
+        app.logger.exception("Could not check cloud access for an account")
+        return None
+    if state["status"] in ("expired", "revoked"):
+        return jsonify({
+            "error": "cloud_expired",
+            "status": state["status"],
+            "expires_at": state["expires_at"].isoformat() if state["expires_at"] else "",
+            "message": "Cloud backup for this account has ended. Contact your ClinicManager provider to renew.",
+        }), 403
+    return None
+
+
+# The client retries a taken email as "email+2", "email+3"... (an orphaned
+# account it can no longer open). The grant is on the email itself.
+_SIGNUP_SUFFIX = re.compile(r"\+\d+$")
+
+
+def _signup_email(username: str) -> str:
+    return _SIGNUP_SUFFIX.sub("", (username or "").strip().lower())
+
+
+def _cloud_signup_allowed(username: str) -> bool:
+    if not CLOUD_SIGNUP_REQUIRES_GRANT:
+        return True
+    from entitlements import account_may_use_cloud
+    try:
+        return account_may_use_cloud(get_db(), _signup_email(username))
+    except Exception:
+        app.logger.exception("Could not check the cloud grant for a signup")
+        return False
+
+
 @app.route("/signup", methods=["POST"])
 def signup():
     data = request.get_json(silent=True) or {}
@@ -281,6 +343,12 @@ def signup():
         return jsonify({"error": "username, password, and salt are required"}), 400
     if len(password) < 8:
         return jsonify({"error": "password must be at least 8 characters"}), 400
+
+    if not _cloud_signup_allowed(username):
+        return jsonify({
+            "error": "cloud_not_enabled",
+            "message": "Cloud backup is not enabled for this account. Contact your ClinicManager provider.",
+        }), 403
 
     if _get_account_by_username(username):
         return jsonify({"error": "username already taken"}), 409
@@ -801,7 +869,6 @@ register_entitlement_routes(app, get_db)
 from message_credits import register_wallet_routes  # noqa: E402
 
 register_wallet_routes(app, get_db)
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8001"))

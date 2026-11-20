@@ -139,6 +139,12 @@ def init_entitlement_tables(db) -> None:
         cur.execute(
             "ALTER TABLE entitlement_grants ADD COLUMN IF NOT EXISTS modules TEXT NOT NULL DEFAULT ''"
         )
+        # Cloud backup is switched on per customer, by the seller, here - never
+        # implied by a plan. Default FALSE, so every existing grant reads as
+        # "no new cloud account"; accounts that already exist keep working.
+        cur.execute(
+            "ALTER TABLE entitlement_grants ADD COLUMN IF NOT EXISTS cloud BOOLEAN NOT NULL DEFAULT FALSE"
+        )
         # Play purchase tokens are the join between an RTDN (which knows the
         # token, not the install) and an install (which knows the token because
         # its own client sent it up after purchase).
@@ -248,7 +254,7 @@ def _active_grants(db, identifier: str) -> list[dict]:
     with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT source, tier, expires_at, revoked, modules
+            SELECT source, tier, expires_at, revoked, modules, cloud
             FROM entitlement_grants
             WHERE install_id = %s AND revoked = FALSE
             """,
@@ -289,6 +295,7 @@ def resolve_entitlement(
     # the winning one alone: a support comp that only raises the tier must not
     # blank the product the customer actually bought.
     granted_modules: list[str] = []
+    cloud = cloud_access_state(db, email) if "@" in email else {"status": "none", "expires_at": None}
     for grant in grants:
         tier = grant["tier"]
         if TIER_RANK.get(tier, -1) > TIER_RANK.get(best_tier, -1):
@@ -312,6 +319,13 @@ def resolve_entitlement(
         # Omitted entirely when nothing was granted, so the client cannot tell
         # "no modules" from "not stated" and wrongly disable everything.
         **({"modules": sorted(granted_modules)} if granted_modules else {}),
+        # Cloud backup for this account, set by hand in /admin/ui like a
+        # licence: whether it is on, its state, and when it ends. The client
+        # offers cloud only while active, shows the days left, and pauses
+        # backup and sync once it has expired; the server enforces the same.
+        "cloud": cloud["status"] == "active",
+        "cloud_status": cloud["status"],
+        "cloud_expires_at": cloud["expires_at"].isoformat() if cloud["expires_at"] else "",
         "features": features,
         "limits": limits,
         "expires_at": expires_at.isoformat() if expires_at else "",
@@ -352,23 +366,64 @@ def upsert_grant(
     revoked: bool = False,
     note: str = "",
     modules: str = "",
+    cloud: bool = False,
 ) -> None:
     with db.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO entitlement_grants (install_id, source, tier, expires_at, revoked, note, modules, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            INSERT INTO entitlement_grants (install_id, source, tier, expires_at, revoked, note, modules, cloud, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (install_id, source) DO UPDATE
             SET tier = EXCLUDED.tier,
                 expires_at = EXCLUDED.expires_at,
                 revoked = EXCLUDED.revoked,
                 note = EXCLUDED.note,
                 modules = EXCLUDED.modules,
+                cloud = EXCLUDED.cloud,
                 updated_at = now()
             """,
-            (install_id, source, tier, expires_at, revoked, note, modules),
+            (install_id, source, tier, expires_at, revoked, note, modules, bool(cloud)),
         )
     db.commit()
+
+
+def cloud_access_state(db, email: str) -> dict:
+    """Where this account email stands on cloud backup, like a licence:
+
+      none    - never given cloud here (or an account from before this
+                existed): no new account may be made, an existing one is left
+                alone
+      active  - allowed, and not past its end date (expires_at None = no end)
+      expired - the days given have run out
+      revoked - taken away with "Remove cloud"
+
+    One row per account (source "cloud"), written by /admin/cloud."""
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        return {"status": "none", "expires_at": None}
+    init_entitlement_tables(db)
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT expires_at, revoked FROM entitlement_grants WHERE install_id = %s AND source = 'cloud'",
+            (_account_key(email),),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"status": "none", "expires_at": None}
+    expires_at = row["expires_at"]
+    if row["revoked"]:
+        status = "revoked"
+    elif expires_at and expires_at <= datetime.now(timezone.utc):
+        status = "expired"
+    else:
+        status = "active"
+    return {"status": status, "expires_at": expires_at}
+
+
+def account_may_use_cloud(db, email: str) -> bool:
+    """Has the seller switched cloud backup on for this account email, and has
+    it not run out? Checked by /signup before it creates a cloud account."""
+    return cloud_access_state(db, email)["status"] == "active"
 
 
 def register_entitlement_routes(app, get_db):
@@ -520,6 +575,53 @@ def register_entitlement_routes(app, get_db):
             }
         )
 
+    @app.route("/admin/cloud", methods=["POST"])
+    def admin_set_cloud_access():
+        """Allow (or take away) cloud backup for one account email.
+
+        The one switch that decides who may have a cloud account. Kept apart
+        from plan grants on purpose - its own row (source "cloud", tier
+        "free"), so allowing cloud never changes a customer's plan or expiry,
+        and changing their plan never touches cloud.
+        Body: {email, allowed: true|false}. Header: X-Admin-Token.
+        Taking it away stops NEW accounts being created for that email; an
+        account that already exists keeps working.
+        """
+        if not require_admin_token():
+            return jsonify({"error": "forbidden"}), 403
+        data = request.get_json(silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        if "@" not in email:
+            return jsonify({"error": "enter the customer's account email"}), 400
+        allowed = bool(data.get("allowed"))
+        expires_at = None
+        if allowed and data.get("days"):
+            try:
+                days = int(data.get("days"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "days must be a whole number"}), 400
+            if days < 1:
+                return jsonify({"error": "days must be at least 1"}), 400
+            expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+        db = get_db()
+        init_entitlement_tables(db)
+        upsert_grant(
+            db,
+            _account_key(email),
+            source="cloud",
+            tier="free",
+            expires_at=expires_at,
+            revoked=not allowed,
+            note="cloud access",
+            cloud=True,
+        )
+        return jsonify({
+            "ok": True,
+            "email": email,
+            "cloud": allowed,
+            "expires_at": expires_at.isoformat() if expires_at else "",
+        })
+
     @app.route("/admin/installs", methods=["GET"])
     def admin_list_installs():
         if not require_admin_token():
@@ -535,7 +637,7 @@ def register_entitlement_routes(app, get_db):
                        (
                        COALESCE(
                            (SELECT json_agg(json_build_object(
-                                'source', g.source, 'tier', g.tier, 'modules', g.modules,
+                                'source', g.source, 'tier', g.tier, 'modules', g.modules, 'cloud', g.cloud,
                                 'expires_at', g.expires_at, 'revoked', g.revoked,
                                 'via_account', false
                             ))
@@ -552,7 +654,7 @@ def register_entitlement_routes(app, get_db):
                        -- endpoint exists to prevent.
                        COALESCE(
                            (SELECT json_agg(json_build_object(
-                                'source', g.source, 'tier', g.tier, 'modules', g.modules,
+                                'source', g.source, 'tier', g.tier, 'modules', g.modules, 'cloud', g.cloud,
                                 'expires_at', g.expires_at, 'revoked', g.revoked,
                                 'via_account', true
                             ))
@@ -687,12 +789,28 @@ _ADMIN_UI_HTML = """<!doctype html>
     <span class="hint">"Not stated" leaves the install on its licence key or its own
       detected setting - pick a product only when you mean to decide it from here.</span>
   </div>
+
   <div class="row">
     <label for="note">Note</label>
     <input type="text" id="note" placeholder="e.g. support comp, refund, manual renewal" style="flex:1; min-width:260px" />
     <button class="primary" id="applyBtn">Apply</button>
   </div>
   <div id="status"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Cloud backup access</h3>
+  <p class="hint" style="margin-top:0">Only emails allowed here can create a cloud account. Everyone else keeps
+    their data on their own computer. Give a number of days like a licence - when they run out (or you press
+    Remove cloud) backup and sync stop and the customer is told; their data stays on their computer and they can
+    still download their last backup. Allow again to renew. Accounts made before this card existed are left alone.</p>
+  <div class="row">
+    <input type="email" id="cloudEmail" placeholder="customer's account email" style="flex:1; min-width:240px" />
+    <input type="number" id="cloudDays" min="1" placeholder="days (blank = no end)" style="width:170px" />
+    <button class="primary" id="cloudAllowBtn">Allow cloud</button>
+    <button id="cloudRemoveBtn">Remove cloud</button>
+  </div>
+  <div id="cloudStatus"></div>
 </div>
 
 <div class="card">
@@ -743,6 +861,31 @@ _ADMIN_UI_HTML = """<!doctype html>
 
   function token() { return (tokenInput.value || "").trim(); }
 
+  function setCloudAccess(allowed) {
+    var email = document.getElementById("cloudEmail").value.trim();
+    var box = document.getElementById("cloudStatus");
+    if (!email) { box.textContent = "Enter the customer's account email."; box.className = "err"; return; }
+    box.textContent = "Saving..."; box.className = "";
+    fetch("/admin/cloud", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Token": token() },
+      body: JSON.stringify({
+        email: email,
+        allowed: allowed,
+        days: allowed ? (parseInt(document.getElementById("cloudDays").value, 10) || null) : null,
+      }),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (!res.ok) { box.textContent = "Failed: " + (res.body.error || "unknown error"); box.className = "err"; return; }
+        box.textContent = res.body.cloud
+          ? "Cloud allowed for " + res.body.email + (res.body.expires_at ? " until " + res.body.expires_at.slice(0, 10) : " with no end date") + "."
+          : "Cloud removed for " + res.body.email + ". Backup and sync stop; the account itself is kept.";
+        box.className = "ok";
+      })
+      .catch(function (e) { box.textContent = "Request failed: " + e; box.className = "err"; });
+  }
+
   function setStatus(msg, isError) {
     var el = document.getElementById("status");
     el.textContent = msg;
@@ -792,6 +935,9 @@ _ADMIN_UI_HTML = """<!doctype html>
       .catch(function (e) { setStatus("Request failed: " + e, true); });
   });
 
+  document.getElementById("cloudAllowBtn").addEventListener("click", function () { setCloudAccess(true); });
+  document.getElementById("cloudRemoveBtn").addEventListener("click", function () { setCloudAccess(false); });
+
   document.getElementById("lookupBtn").addEventListener("click", function () {
     var email = document.getElementById("lookupEmail").value.trim();
     var box = document.getElementById("lookupResult");
@@ -814,7 +960,8 @@ _ADMIN_UI_HTML = """<!doctype html>
       var exp = g.expires_at ? g.expires_at : "no expiry";
       var label = g.via_account ? "account: " : "";
       var mods = g.modules ? " \u00b7 " + g.modules : "";
-      return "<div class=\\"" + cls + "\\">" + label + g.source + ": " + g.tier + mods + " (" + exp + ")</div>";
+      var cloud = g.cloud ? " \u00b7 cloud" : "";
+      return "<div class=\\"" + cls + "\\">" + label + g.source + ": " + g.tier + mods + cloud + " (" + exp + ")</div>";
     }).join("");
   }
 

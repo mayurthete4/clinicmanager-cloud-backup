@@ -62,6 +62,30 @@ Cloud," and enable automatic scheduled cloud backups the same way local
 auto-backup already works. On a replacement PC, they log in with the same
 username + password to pull their latest backup back down.
 
+## Who may use cloud backup (like a licence)
+
+In `/admin/ui`, the **Cloud backup access** card: type the customer's account
+email, optionally a number of **days**, and press **Allow cloud**. Blank days
+means no end date. Press **Allow cloud** again to renew; **Remove cloud** stops it
+straight away. It is separate from plan grants - it never changes a customer's
+plan or expiry, and works on any plan, including the free trial.
+
+- Not allowed: `/signup` answers `403 cloud_not_enabled`; the desktop app keeps
+  the customer's data on their own computer and setup does not even ask.
+- Allowed: the app switches cloud on by itself at setup (or the customer turns
+  it on in Settings). Settings, Backups and Subscription show "Cloud active -
+  N days left"; a warning appears in the last 7 days.
+- Ended or removed: backup uploads, sync, pairing and bill reading answer
+  `403 cloud_expired`; signing in, the status check and downloading the last
+  backup still work, so the customer's data is never held back. The app shows
+  "Cloud backup has ended" and carries on locally. Allowing again resumes
+  everything with nothing to do on the customer's PC.
+- Accounts made before this card existed (no entry here at all) are left alone.
+
+```
+CLOUD_SIGNUP_REQUIRES_GRANT=1   # default; set 0 only to go back to open signups
+```
+
 ## Free-tier capacity note
 
 Neon's free tier caps out at 0.5 GB total storage. At roughly 10-30 MB per
